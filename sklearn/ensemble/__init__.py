@@ -3,6 +3,7 @@ The :mod:`sklearn.ensemble` module includes ensemble-based methods for
 classification, regression and anomaly detection.
 """
 from ._base import BaseEnsemble
+from ._coherence import BalsubramaniFreundClassifier
 from ._forest import RandomForestClassifier
 from ._forest import RandomForestRegressor
 from ._forest import RandomTreesEmbedding
@@ -44,4 +45,5 @@ __all__ = [
     "StackingRegressor",
     "HistGradientBoostingClassifier",
     "HistGradientBoostingRegressor",
+    "BalsubramaniFreundClassifier",
 ]
