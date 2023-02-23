@@ -209,6 +209,34 @@ class BalsubramaniFreundClassifier(_BaseHeterogeneousEnsemble, ClassifierMixin):
                     deterministic predictions, i.e. pred_type='determ'")
         return self
 
+    def _validate_cvx_program_params(self):
+        def _check_if_valid_probs(distri, name):
+            # check all values between 0 and 1 inclusive
+            try:
+                if not all(0 <= ele <= 1 for ele in distri):
+                    raise ValueError(f"{name} must be between 0 and 1.")
+            except TypeError:
+                if not 0 <= distri <= 1:
+                    raise ValueError(f"{name} must be between 0 and 1.")
+
+            if np.sum(distri) > 1:
+                raise ValueError(f"{name} must not sum to over 1.")
+
+        _check_if_valid_probs(self.class_freq_lb_, 'Class frequencies')
+
+        for i in range(self.n_estimators_):
+            if self.constraint == 'accuracy':
+                _check_if_valid_probs(self.accuracy_lb_[i],\
+                        f"Estimator {i}'s accuracy")
+            else:
+                for j in range(self.n_classes_):
+                    if self.constraint == 'class_accuracy':
+                        _check_if_valid_probs(self.class_accuracy_lb_[i][j],\
+                                f"Estimator {i}'s class accuracies")
+                    elif self.constraint == 'confusion_matrix':
+                        _check_if_valid_probs(self.confusion_matrix_lb_[i][j,],\
+                                f"Estimator {i}'s confusion matrix row {j}")
+
     def _confint(self, count, nobs):
         return proportion_confint(count, nobs, alpha=self.signif_lvl,\
                 method=self.lb_type)
@@ -268,7 +296,7 @@ class BalsubramaniFreundClassifier(_BaseHeterogeneousEnsemble, ClassifierMixin):
         self.predict_method_ = 'predict' if self.pred_type=='determ'\
                 else 'predict_proba'
 
-        # Generate predictions from prefit models.
+        # Generate predictions from now fit estimators.
         predictions = [
                 getattr(estimator, self.predict_method_)(X)
                 for estimator in all_estimators
@@ -296,11 +324,7 @@ class BalsubramaniFreundClassifier(_BaseHeterogeneousEnsemble, ClassifierMixin):
 
         # compute the counts needed for confidence interval/conversion from
         # counts to probabilities.
-        if self.constraint == 'accuracy':
-            num_samples = _num_samples(X)
-        elif self.constraint == 'confusion_matrix':
-            conf_mat_samples = repmat(self.class_freq_cts_,\
-                        self.n_classes_, 1).T
+        num_samples = _num_samples(X)
 
         # perform lower bounding if asked for
         if self.lb_type is None:
@@ -309,11 +333,11 @@ class BalsubramaniFreundClassifier(_BaseHeterogeneousEnsemble, ClassifierMixin):
                 self.accuracy_lb_ = self.accuracy_counts_ / num_samples
             elif self.constraint == 'class_accuracy':
                 self.class_accuracy_lb_ = [
-                        class_acc_count / self.class_freq_cts_\
+                        class_acc_count / num_samples\
                         for class_acc_count in self.class_accuracy_counts]
             elif self.constraint == 'confusion_matrix':
                 self.confusion_matrix_lb_ = [
-                        conf_mat_count / conf_mat_samples\
+                        conf_mat_count / num_samples\
                         for conf_mat_count in self.confusion_matrix_counts_]
         else:
             self.class_freq_lb_, _ = \
@@ -325,16 +349,26 @@ class BalsubramaniFreundClassifier(_BaseHeterogeneousEnsemble, ClassifierMixin):
                         for acc_count in self.accuracy_counts_]
             elif self.constraint == 'class_accuracy':
                 self.class_accuracy_lb_, _ = \
-                        [self._confint(class_acc_count, self.class_freq_cts_)\
+                        [self._confint(class_acc_count, num_samples)\
                         for class_acc_count in self.class_accuracy_counts]
             elif self.constraint == 'confusion_matrix':
                 self.confusion_matrix_lb_, _ = \
-                        [self._confint(conf_mat_count, conf_mat_samples)\
+                        [self._confint(conf_mat_count, num_samples)\
                         for conf_mat_count in self.confusion_matrix_counts_]
+
+        if self.constraint is ('class_accuracy' or 'confusion_matrix'):
+            self.estimator_pred_class_freqs_ = [self.class_freq_lb_
+                    for i in range(self.n_estimators_)]
 
         return self
 
-    def fit_unknown_ensemble(self, estimator_params, class_freqs, classes, n_estimators):
+    def fit_unknown_ensemble(
+            self,
+            estimator_params,
+            class_freqs,
+            classes,
+            n_estimators,
+            ):
         """A reference implementation of a fitting function for a classifier.
 
         Parameters
@@ -375,10 +409,11 @@ class BalsubramaniFreundClassifier(_BaseHeterogeneousEnsemble, ClassifierMixin):
                             f"rather than the expected {self.n_classes_}")
         elif self.constraint == 'confusion_matrix':
             for i in range(self.n_estimators_):
-                if estimator_params[i].shape != (self.n_classes_, self.n_classes_):
+                if estimator_params[i].shape !=\
+                        (self.n_classes_, self.n_classes_):
                     raise ValueError(f"Estimator {i} has confusion matrix of "
                             f"size {estimator_params[i].shape}, "
-                            "rather than the expected ({self.n_classes_}, "
+                            f"rather than the expected ({self.n_classes_}, "
                             f"{self.n_classes_}).")
 
         self.class_freq_lb_ = class_freqs
@@ -390,16 +425,18 @@ class BalsubramaniFreundClassifier(_BaseHeterogeneousEnsemble, ClassifierMixin):
         elif self.constraint == 'confusion_matrix':
             self.confusion_matrix_lb_ = estimator_params
 
+        self._validate_cvx_program_params()
+
         return self
 
-    def _make_orig_cvx_prog_constraints(self, predictions, n_samples, gt):
+    def _make_orig_cvx_prog_constraints(self, predictions, n_samples):
         """ Makes the Balsubrani-Freund convex program a la the original paper.
         """
         # set the comparison we want to use
         if self.use_equality_constraints:
             oper = operator.eq
         else:
-            oper = operator.gt
+            oper = operator.ge
 
         self.cp_constraints_ = []
 
@@ -417,7 +454,7 @@ class BalsubramaniFreundClassifier(_BaseHeterogeneousEnsemble, ClassifierMixin):
                     self.cp_rhs_class_accuracies_[i * self.n_classes_ : (i + 1) * self.n_classes_].value = self.class_accuracy_lb_[i]
             else:
                 # number of entries in a confusion matrix
-                cm_len = np.pow(self.n_classes_, 2)
+                cm_len = np.power(self.n_classes_, 2)
                 self.cp_rhs_confusion_matrix_ = cp.Parameter(self.n_estimators_ *\
                         cm_len, nonneg=True)
                 for i in range(self.n_estimators_):
@@ -448,15 +485,14 @@ class BalsubramaniFreundClassifier(_BaseHeterogeneousEnsemble, ClassifierMixin):
         self.cp_var_preds_ = cp.Variable((n_samples, self.n_classes_))
 
         for i in range(self.n_estimators_):
+            prediction_mass = np.sum(predictions[i])
             if self.constraint == 'accuracy':
-                prediction_mass = np.sum(predictions[i])
                 self.cp_constraints_.append(oper(
                     cp.sum(
                         cp.multiply(predictions[i], self.cp_var_preds_)),
                     self.cp_rhs_accs_[i] * prediction_mass))
 
             elif self.constraint == 'class_accuracy':
-                prediction_mass = np.sum(predictions[i], axis=0)
                 self.cp_constraints_.append(oper(
                     cp.sum(cp.multiply(predictions[i], self.cp_var_preds_)
                         , axis=0)
@@ -468,12 +504,11 @@ class BalsubramaniFreundClassifier(_BaseHeterogeneousEnsemble, ClassifierMixin):
                 # estimating Pr(Y | h_i(X)).  This is done by multiplying the
                 # lower bounded class frequencies, one class per row.
 
-                prediction_mass = np.sum(predictions[i])
-                class_freq_mat = repmat(self.cp_rhs_class_freq_, self.n_classes_, 1)
-                lhs_ravel = np.ravel(self.cp_var_preds_.T\
-                                                        @ predictions[i])
-                rhs_ravel = np.ravel(self.cp_rhs_confusion_matrix_ *\
-                        class_freq_mat.T * prediction_mass)
+                cm_len = np.power(self.n_classes_, 2)
+                lhs_ravel = cp.reshape(self.cp_var_preds_.T\
+                        @ predictions[i], (cm_len, 1), order='C')
+                rhs_ravel = cp.reshape(self.cp_rhs_confusion_matrix_[i] *\
+                        prediction_mass, (cm_len, 1), order='C')
                 self.cp_constraints_.append(oper(lhs_ravel, rhs_ravel))
 
         # make class frequency constraints
@@ -494,24 +529,9 @@ class BalsubramaniFreundClassifier(_BaseHeterogeneousEnsemble, ClassifierMixin):
         if self.use_equality_constraints:
             oper = operator.eq
         else:
-            oper = operator.gt
+            oper = operator.ge
 
         self.cp_constraints_ = []
-
-        # transform the class accuracies/confusion matrix entries by
-        # multiplying with class frequency lower bound.
-
-        if self.constraint == 'class_accuracy':
-            self.class_accuracy_joint_lb_ = [
-                    np.multiply(class_accs, self.class_freq_lb_)
-                    for class_accs in self.class_accuracy_lb_
-                    ]
-        elif self.constraint == 'confusion_matrix':
-            class_freq_mat = repmat(self.class_freq_lb_, self.n_classes_, 1)
-            self.confusion_matrix_joint_lb_ = [
-                    np.multiply(conf_mat, class_freq_mat)
-                    for conf_mat in self.confusion_matrix_lb_
-                    ]
 
         if self.use_parameters:
             #assign parameters to rhs
@@ -525,7 +545,7 @@ class BalsubramaniFreundClassifier(_BaseHeterogeneousEnsemble, ClassifierMixin):
             elif self.constraint == 'class_accuracy':
                 self.cp_rhs_joint_class_accs_ = cp.Parameter(self.n_estimators_ * self.n_classes_, nonneg=True)
                 for i in range(self.n_estimators_):
-                    self.cp_rhs_joint_class_accs_[i * self.n_classes_ : (i + 1) * self.n_classes_].value = self.class_accuracy_joint_lb_[i]
+                    self.cp_rhs_joint_class_accs_[i * self.n_classes_ : (i + 1) * self.n_classes_].value = self.class_accuracy_lb_[i]
 
             else:
                 # number of entries in a confusion matrix
@@ -533,8 +553,8 @@ class BalsubramaniFreundClassifier(_BaseHeterogeneousEnsemble, ClassifierMixin):
                 self.cp_rhs_joint_conf_mat_ = cp.Parameter(self.n_estimators_ *\
                         cm_len, nonneg=True)
                 for i in range(self.n_estimators_):
-                    self.cp_rhs_confusion_matrix_[i*cm_len : (i + 1)*cm_len]\
-                            = np.ravel(self.confusion_matrix_joint_lb_[i])
+                    self.cp_rhs_joint_conf_mat_[i*cm_len : (i + 1)*cm_len]\
+                            = np.ravel(self.confusion_matrix_lb_[i])
 
         else:
             #set RHS to usual suspects
@@ -543,33 +563,33 @@ class BalsubramaniFreundClassifier(_BaseHeterogeneousEnsemble, ClassifierMixin):
             if self.constraint == 'accuracy':
                 self.cp_rhs_accs_ = self.accuracy_lb_
             elif self.constraint == 'class_accuracy':
-                self.cp_rhs_joint_class_accs_ = self.class_accuracy_joint_lb_
+                self.cp_rhs_joint_class_accs_ = self.class_accuracy_lb_
             else:
-                self.cp_rhs_joint_conf_mat_ = self.confusion_matrix_joint_lb_
+                self.cp_rhs_joint_conf_mat_ = self.confusion_matrix_lb_
 
         # convert predictions into 1 hot encoding and make the resulting
         # matrix sparse if deterministic predictions.
         #for each classifier, convert all their predictions to 1 hot
         # then append their predictions
         self.oh_le_ = OneHotEncoder(sparse_output=True)
-        self.oh_le_.fit(np.arange(self.n_classes_))
+        self.oh_le_.fit(np.arange(self.n_classes_).reshape(-1, 1))
 
         # compute the number of unique patterns
         predictions = np.array(predictions)
-        unique_cols, col_inv, col_cts = np.unique(predictions, axis=1,\
+        self.unique_cols, col_inv, col_cts = np.unique(predictions, axis=1,\
                 return_counts=True, return_inverse=True)
         # save the inverse so the prediction can be reconstructed
-        self.joint_pred_col_inv = col_inv
+        self.joint_pred_col_inv_ = col_inv
 
-        n_uniq_cols = unique_cols.shape[1]
+        n_uniq_cols = self.unique_cols.shape[1]
 
         self.cp_var_joint_preds_ = cp.Variable((n_uniq_cols,\
                 self.n_classes_))
 
         for i in range(self.n_estimators_):
             if self.constraint == 'accuracy':
-                preds = unique_cols[i, :].reshape(-1, 1)
-                preds_one_hot = self.oh_le_.transform(preds).to_array()
+                preds = self.unique_cols[i, :].reshape(-1, 1)
+                preds_one_hot = self.oh_le_.transform(preds).toarray()
                 preds_one_hot = np.reshape(preds_one_hot,\
                         (n_uniq_cols, self.n_classes_))
                 self.cp_constraints_.append(oper(
@@ -583,17 +603,17 @@ class BalsubramaniFreundClassifier(_BaseHeterogeneousEnsemble, ClassifierMixin):
                 col = []
 
                 for j in range(n_uniq_cols):
-                    row.append(unique_cols[i, j])
-                    col.append(j * self.n_classes_ + unique_cols[i, j])
+                    row.append(self.unique_cols[i, j])
+                    col.append(j * self.n_classes_ + self.unique_cols[i, j])
 
                 row = np.array(row)
                 col = np.array(col)
                 data = [1] * len(row)
                 C = coo_array((data, (row, col)),
-                        shape=(self.n_classes_, n_uniq_cols))
+                        shape=(self.n_classes_, n_uniq_cols * self.n_classes_))
                 self.cp_constraints_.append(oper(
                     C @ cp.reshape(self.cp_var_joint_preds_,
-                        (1, -1), order='C'),
+                        (n_uniq_cols* self.n_classes_, ), order='C'),
                     self.cp_rhs_joint_class_accs_[i]
                     ))
 
@@ -605,17 +625,17 @@ class BalsubramaniFreundClassifier(_BaseHeterogeneousEnsemble, ClassifierMixin):
                     col = []
 
                     for j in range(n_uniq_cols):
-                        row.append(unique_cols[i, j])
+                        row.append(self.unique_cols[i, j])
                         col.append(j * self.n_classes_ + l)
 
                     row = np.array(row)
                     col = np.array(col)
                     data = [1] * len(row)
                     C = coo_array((data, (row, col)),
-                            shape=(self.n_classes_, n_uniq_cols))
+                            shape=(self.n_classes_, n_uniq_cols * self.n_classes_))
                     self.cp_constraints_.append(oper(
                         C @ cp.reshape(self.cp_var_joint_preds_,
-                            (1, -1), order='C'),
+                            (n_uniq_cols * self.n_classes_, ), order='C'),
                         self.cp_rhs_joint_conf_mat_[i][l, :]
                         ))
 
@@ -628,12 +648,12 @@ class BalsubramaniFreundClassifier(_BaseHeterogeneousEnsemble, ClassifierMixin):
                 self.class_freq_lb_))
 
         # enforce that the predictions form a probability distribution
-        self.cp_constraints_.append(self.cp_var_joint_preds_ >= 0,
-                cp.sum(self.cp_var_joint_preds_) == 1)
+        self.cp_constraints_ += [self.cp_var_joint_preds_ >= 0,
+                cp.sum(self.cp_var_joint_preds_) == 1]
 
         return self
 
-    def predict(self, X, gt):
+    def predict(self, X):
         """ A reference implementation of a prediction for a classifier.
 
         Parameters
@@ -650,12 +670,12 @@ class BalsubramaniFreundClassifier(_BaseHeterogeneousEnsemble, ClassifierMixin):
         # Check is fit had been called
         check_is_fitted(self)
 
-        y = self.predict_proba(X, gt)
+        y = self.predict_proba(X)
         y = np.argmax(y, axis = 1)
 
         return self.le_.inverse_transform(y)
 
-    def predict_proba(self, X, gt):
+    def predict_proba(self, X):
         """ Solves the convex program and returns the computed probabilities.
 
         """
@@ -686,16 +706,18 @@ class BalsubramaniFreundClassifier(_BaseHeterogeneousEnsemble, ClassifierMixin):
                     ]
 
         if self.prog_type == 'orig':
-            self._make_orig_cvx_prog_constraints(predictions, n_samples, gt)
+            self._make_orig_cvx_prog_constraints(predictions, n_samples)
+            pred_vars = self.cp_var_preds_
         else:
             self._make_joint_cvx_prog_constraints(predictions, n_samples)
+            pred_vars = self.cp_var_joint_preds_
 
         if self.loss == '0-1':
             self.cp_objective_ = cp.Minimize(cp.sum(
-                cp.norm(self.cp_var_preds_, 'inf', axis=1)) / n_samples)
+                cp.norm(pred_vars, 'inf', axis=1)) / n_samples)
         elif self.loss == 'Xent':
             self.cp_objective_ = cp.Maximize(cp.sum(
-                cp.entr(self.cp_var_preds_)) / n_samples)
+                cp.entr(pred_vars)) / n_samples)
 
         problem = cp.Problem(self.cp_objective_, self.cp_constraints_)
 
@@ -703,6 +725,10 @@ class BalsubramaniFreundClassifier(_BaseHeterogeneousEnsemble, ClassifierMixin):
         problem.solve(solver=self.solver, verbose=self.verbose)
 
         # retrieve and return solution
-        probs = self.cp_var_preds_.value
+        probs = pred_vars.value
+
+        # convert back from pattern to actual datapoints
+        if self.prog_type == 'joint_compact':
+            probs = probs[self.joint_pred_col_inv_, :]
 
         return probs
