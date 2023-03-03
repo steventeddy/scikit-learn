@@ -184,6 +184,14 @@ class BalsubramaniFreundClassifier(_BaseHeterogeneousEnsemble, ClassifierMixin):
 
         return names, all_estimators
 
+    def _check_has_predicted_joint(self):
+        """
+        Check to see if a prediction has been made with a program with type
+        prog_type='joint_compact'
+        """
+
+        return hasattr(self, "cp_var_joint_preds_")
+
     def _validate_params(self):
         super()._validate_params()
 
@@ -204,6 +212,19 @@ class BalsubramaniFreundClassifier(_BaseHeterogeneousEnsemble, ClassifierMixin):
             raise ValueError(f"Program type {self.prog_type} must be used with\
                     deterministic predictions, i.e. pred_type='determ'")
         return self
+
+    def _get_prediction_patterns(self, predictions):
+        """
+        Get the prediction patterns of the ensemble.
+        """
+        # compute the number of unique patterns
+        self.predictions_ = np.array(predictions)
+        self.unique_cols_, self.col_uniq_inds_, self.col_inv_, self.col_cts_ = \
+                np.unique(self.predictions_, axis=1, return_counts=True,\
+                return_inverse=True, return_index=True)
+
+        self.n_uniq_cols_ = self.unique_cols_.shape[1]
+
 
     def _validate_cvx_program_params(self):
         def _check_if_valid_probs(distri, name):
@@ -425,7 +446,7 @@ class BalsubramaniFreundClassifier(_BaseHeterogeneousEnsemble, ClassifierMixin):
 
         return self
 
-    def _make_orig_cvx_prog_constraints(self, predictions, n_samples):
+    def _make_orig_cvx_prog_constraints(self, predictions):
         """ Makes the Balsubrani-Freund convex program a la the original paper.
         """
         # set the comparison we want to use
@@ -434,7 +455,7 @@ class BalsubramaniFreundClassifier(_BaseHeterogeneousEnsemble, ClassifierMixin):
         else:
             oper = operator.ge
 
-        self.cp_constraints_ = []
+        constraints = []
 
         if self.use_parameters:
             #assign parameters to rhs
@@ -478,19 +499,19 @@ class BalsubramaniFreundClassifier(_BaseHeterogeneousEnsemble, ClassifierMixin):
                     self.oh_le_.transform(prediction.reshape(-1,1)).toarray()
                     for prediction in predictions]
 
-        self.cp_var_preds_ = cp.Variable((n_samples, self.n_classes_))
+        variables = cp.Variable((self.n_samples_in_pred_x_, self.n_classes_))
 
         for i in range(self.n_estimators_):
             prediction_mass = np.sum(predictions[i])
             if self.constraint == 'accuracy':
-                self.cp_constraints_.append(oper(
+                constraints.append(oper(
                     cp.sum(
-                        cp.multiply(predictions[i], self.cp_var_preds_)),
+                        cp.multiply(predictions[i], variables)),
                     self.cp_rhs_accs_[i] * prediction_mass))
 
             elif self.constraint == 'class_accuracy':
-                self.cp_constraints_.append(oper(
-                    cp.sum(cp.multiply(predictions[i], self.cp_var_preds_)
+                constraints.append(oper(
+                    cp.sum(cp.multiply(predictions[i], variables)
                         , axis=0)
                     , self.cp_rhs_class_accuracies_[i] * prediction_mass))
             else:
@@ -501,22 +522,22 @@ class BalsubramaniFreundClassifier(_BaseHeterogeneousEnsemble, ClassifierMixin):
                 # lower bounded class frequencies, one class per row.
 
                 cm_len = np.power(self.n_classes_, 2)
-                lhs_ravel = cp.reshape(self.cp_var_preds_.T\
+                lhs_ravel = cp.reshape(variables.T\
                         @ predictions[i], (cm_len, 1), order='C')
                 rhs_ravel = cp.reshape(self.cp_rhs_confusion_matrix_[i] *\
                         prediction_mass, (cm_len, 1), order='C')
-                self.cp_constraints_.append(oper(lhs_ravel, rhs_ravel))
+                constraints.append(oper(lhs_ravel, rhs_ravel))
 
         # make class frequency constraints
-        self.cp_constraints_.append(oper(
-            cp.sum(self.cp_var_preds_, axis=0),
-            self.class_freq_lb_ * n_samples))
+        constraints.append(oper(
+            cp.sum(variables, axis=0),
+            self.class_freq_lb_ * self.n_samples_in_pred_x_))
 
         # enforce each prediction being a probability distribution
-        self.cp_constraints_ += [cp.sum(self.cp_var_preds_, axis=1) == 1,
-                self.cp_var_preds_ >= 0]
+        constraints += [cp.sum(variables, axis=1) == 1,
+                variables >= 0]
 
-        return self
+        return variables, constraints
 
     def _make_constraint_rhs(self):
         """ Makes the RHS to the C matrix from the new paper
@@ -568,20 +589,8 @@ class BalsubramaniFreundClassifier(_BaseHeterogeneousEnsemble, ClassifierMixin):
         """ Makes the C matrix from the new paper
         """
 
-        # convert predictions into 1 hot encoding and make the resulting
-        # matrix sparse if deterministic predictions.
-        #for each classifier, convert all their predictions to 1 hot
-        # then append their predictions
-        self.oh_le_ = OneHotEncoder(sparse_output=True)
-        self.oh_le_.fit(np.arange(self.n_classes_).reshape(-1, 1))
-
-        # compute the number of unique patterns
-        predictions = np.array(predictions)
-        self.unique_cols_, self.col_inv_, self.col_cts_ = \
-                np.unique(predictions, axis=1, return_counts=True,\
-                return_inverse=True)
-
-        self.n_uniq_cols_ = self.unique_cols_.shape[1]
+        # get patterns
+        self._get_prediction_patterns(predictions)
 
         # make C matrix now
         c_blocks = []
@@ -597,7 +606,6 @@ class BalsubramaniFreundClassifier(_BaseHeterogeneousEnsemble, ClassifierMixin):
                 row = np.array([0] * len(col))
                 data = np.array([1] * len(col))
                 C = coo_array((data, (row, col)), shape=(1, self.n_uniq_cols_ * self.n_classes_))
-                #preds_one_hot = self.oh_le_.transform(preds).toarray()
                 #c_blocks.append(preds_one_hot)
                 c_blocks.append(C)
 
@@ -638,7 +646,7 @@ class BalsubramaniFreundClassifier(_BaseHeterogeneousEnsemble, ClassifierMixin):
         self.c_ = vstack(c_blocks, 'coo')
         self._make_constraint_rhs()
 
-    def _make_joint_cvx_prog_constraints(self, predictions, n_samples, variables=None):
+    def _make_joint_cvx_prog_constraints(self, predictions, variables=None):
         """ Makes the Balsubrani-Freund convex program like the new paper.
         """
         # set the comparison we want to use
@@ -660,31 +668,29 @@ class BalsubramaniFreundClassifier(_BaseHeterogeneousEnsemble, ClassifierMixin):
         # is two dimensional
         c_rhs = np.expand_dims(c_rhs, axis=1)
 
-        print(self.c_)
         if variables is None:
-            self.cp_var_joint_preds_ = cp.Variable((self.n_uniq_cols_ *\
+            variables = cp.Variable((self.n_uniq_cols_ *\
                 self.n_classes_, 1))
-            variables = self.cp_var_joint_preds_
 
-        self.cp_constraints_ = []
-        self.cp_constraints_.append(oper(self.c_ @ variables, c_rhs))
+        constraints = []
+        constraints.append(oper(self.c_ @ variables, c_rhs))
 
         # enforce that the predictions form a probability distribution
-        self.cp_constraints_ += [variables >= 0,
+        constraints += [variables >= 0,
                 cp.sum(variables, axis=0) == 1]
 
         # make the constraints that every model will have, i.e. enforcing
         # class frequencies and distribution of patterns.
-        self.cp_constraints_ += [cp.sum(cp.reshape(variables[:, i], \
+        constraints += [cp.sum(cp.reshape(variables[:, i], \
                 (self.n_uniq_cols_, self.n_classes_), order='C'), axis=1) ==\
-                self.col_cts_/n_samples
+                self.col_cts_ / self.n_samples_in_pred_x_
                 for i in range(variables.shape[1])]
-        self.cp_constraints_ += [cp.sum(cp.reshape(variables[:, i], \
+        cp_constraints += [cp.sum(cp.reshape(variables[:, i], \
                 (self.n_uniq_cols_, self.n_classes_), order='C'), axis=0) ==\
                 self.class_freq_lb_
                 for i in range(variables.shape[1])]
 
-        return self
+        return variables, constraints
 
     def predict(self, X):
         """ A reference implementation of a prediction for a classifier.
@@ -717,21 +723,23 @@ class BalsubramaniFreundClassifier(_BaseHeterogeneousEnsemble, ClassifierMixin):
         if self.unknown_ensemble:
             # make sure each estimator predicts on the same number of points
             if self.pred_type == 'determ':
-                n_samples = len(X[0])
+                self.n_samples_in_pred_x_ = len(X[0])
                 for i in range(1, self.n_estimators_):
-                    if len(X[i]) != n_samples:
-                        raise ValueError(f"Expected {n_samples} predictions, "
-                                f"but estimator {i} only has {len(X[i])}.")
+                    if len(X[i]) != self.n_samples_in_pred_x_:
+                        raise ValueError(f"Expected {self.n_samples_in_pred_x_}"
+                                f" predictions, but estimator {i} only has"
+                                f" {len(X[i])}.")
             elif self.pred_type == 'prob':
-                n_samples = X[0].shape[0]
+                self.n_samples_in_pred_x_ = X[0].shape[0]
                 for i in range(1, self.n_estimators_):
-                    if X[i].shape[0] != n_samples:
-                        raise ValueError(f"Expected {n_samples} predictions, "
-                                f"but estimator {i} only has {X[i].shape[0]}.")
+                    if X[i].shape[0] != self.n_samples_in_pred_x_:
+                        raise ValueError(f"Expected {self.n_samples_in_pred_x_}"
+                                f"predictions, but estimator {i} only has"
+                                f" {X[i].shape[0]}.")
             predictions = X
 
         else:
-            n_samples = X.shape[0]
+            self.n_samples_in_pred_x_ = X.shape[0]
 
             predictions = [
                     getattr(estimator, self.predict_method_)(X)
@@ -739,20 +747,22 @@ class BalsubramaniFreundClassifier(_BaseHeterogeneousEnsemble, ClassifierMixin):
                     ]
 
         if self.prog_type == 'orig':
-            self._make_orig_cvx_prog_constraints(predictions, n_samples)
-            pred_vars = self.cp_var_preds_
+            pred_vars, constrs = self._make_orig_cvx_prog_constraints(predictions)
+            self.cp_var_preds_ = pred_vars
+            self.cp_pred_constraints_ = constrs
         else:
-            self._make_joint_cvx_prog_constraints(predictions, n_samples)
-            pred_vars = self.cp_var_joint_preds_
+            pred_vars, constrs = self._make_joint_cvx_prog_constraints(predictions)
+            self.cp_var_joint_preds_ = pred_vars
+            self.cp_pred_constraints_ = constrs
 
         if self.loss == '0-1':
             self.cp_objective_ = cp.Minimize(cp.sum(
-                cp.norm(pred_vars, 'inf', axis=1)) / n_samples)
+                cp.norm(pred_vars, 'inf', axis=1)) / self.n_samples_in_pred_x_)
         elif self.loss == 'Xent':
             self.cp_objective_ = cp.Maximize(cp.sum(
-                cp.entr(pred_vars)) / n_samples)
+                cp.entr(pred_vars)) / self.n_samples_in_pred_x_)
 
-        problem = cp.Problem(self.cp_objective_, self.cp_constraints_)
+        problem = cp.Problem(self.cp_objective_, self.cp_pred_constraints_)
 
         # solve problem
         problem.solve(solver=self.solver, verbose=self.verbose)
@@ -762,7 +772,74 @@ class BalsubramaniFreundClassifier(_BaseHeterogeneousEnsemble, ClassifierMixin):
 
         # convert back from pattern to actual datapoints
         if self.prog_type == 'joint_compact':
-            probs /= np.expand_dims(self.col_cts_, axis=1) / n_samples
+            probs /= np.expand_dims(self.col_cts_, axis=1) / self.n_samples_in_pred_x_
             probs = probs[self.col_inv_, :]
 
         return probs
+
+    def convert_gt_to_pattern(self, gt, joint_dist=True):
+        """
+        Encodes the ground truth in terms of patterns, rather than all
+        datapoints.
+
+        Conditional means the ground truth will be a conditional distribution
+        of labels given the ensemble's prediction pattern.  Each row is
+        associated with a pattern and sum to 1
+        Joint will give the joint distribution of labels and patterns. The sum
+        of all elemennts will sum to 1.
+        """
+        if not self._check_has_predicted_joint():
+            raise AttributeError("You must predict with prog_type='joint_com\
+                    act' before you can convert the ground truth.")
+
+        if gt.ndim != 1:
+            raise TypeError("Ground truth must be a 1D vector, but has"
+                    f"{gt.ndim} dimensions.")
+        gt = self.le_.transform(gt)
+        gt_pattern = np.zeros(self.n_uniq_cols_, self.n_classes_)
+
+        for i in range(self.n_uniq_cols_):
+            curr_col = self.n_uniq_cols_[:, i]
+            offset = self.col_uniq_inds_[i]
+            pred_subset = self.predictions_[:, offset:]
+            inds = np.argwhere([np.array_equiv(pred_subset[:, j], curr_col)
+                for j in range(pred_subset.shape[1])])
+            for ind in inds:
+                gt_pattern[i, gt[offset + ind]] += 1
+
+        if not joint_dist:
+            gt_pattern /= self.col_cts_
+        else:
+            gt_pattern /= np.sum(gt_pattern)
+
+        return gt_pattern
+
+    def get_confidence_intervals(self):
+        """
+        Gets confidence intervals for each pattern.  Does this by solving
+        2* tau, where tau is the total number of patterns
+        """
+        if not self._check_has_predicted_joint():
+            raise AttributeError("You must predict with prog_type='joint_com\
+                    act' before you can compute confidence intervals.")
+
+        conf_int = np.zeros((self.n_uniq_cols_, self.n_classes_))
+
+        #get constraints to form a program
+        ci_vars, ci_constrs = self._make_joint_cvx_prog_constraints(self.predictions_)
+        selection = cp.Parameter(self.n_uniq_cols_)
+        self.cp_var_ci = ci_vars
+        self.cp_ci_constraints = ci_constrs
+
+        lb_obj = cp.Minimize(selection.T @ ci_vars)
+        ub_obj = cp.Maximize(selection.T @ ci_vars)
+
+        for j, obj in enumerate([lb_obj, ub_obj]):
+            for i in range(self.n_uniq_cols_):
+                selection.value = 0
+                selection[i].value = 1
+                prob = cp.Problem(obj, self.cp_ci_constraints)
+                prob.solve(solver=self.solver, verbose=self.verbose, warm_start=True)
+                conf_int[i, j] = prob.value
+
+
