@@ -213,7 +213,7 @@ class BalsubramaniFreundClassifier(_BaseHeterogeneousEnsemble, ClassifierMixin):
                     deterministic predictions, i.e. pred_type='determ'")
         return self
 
-    def _get_prediction_patterns(self, predictions):
+    def _get_prediction_patterns(self, predictions, pattern_cts):
         """
         Get the prediction patterns of the ensemble.
         """
@@ -222,6 +222,23 @@ class BalsubramaniFreundClassifier(_BaseHeterogeneousEnsemble, ClassifierMixin):
         self.unique_cols_, self.col_uniq_inds_, self.col_inv_, self.col_cts_ = \
                 np.unique(self.predictions_, axis=1, return_counts=True,\
                 return_inverse=True, return_index=True)
+
+        if pattern_cts is not None:
+            # recompute the stuff from above to expand the data
+            if pattern_cts.ndim != 1:
+                raise ValueError("pattern_cts must have 1 dimension"
+                        f"but has {pattern_cts.ndim}.")
+            self.col_cts_ = pattern_cts
+            self.col_uniq_inds_ = np.zeros(len(pattern_cts))
+            self.col_inv_ = np.zeros(np.sum(pattern_cts))
+
+            offset = 0
+            for i in range(len(pattern_cts) - 1):
+                new_ind = pattern_cts[i] + offset
+                self.col_uniq_inds_[i + 1] = new_ind
+                self.col_inv_[offset:new_ind] = np.array([i] * pattern_cts[i])
+                offset += pattern_cts[i]
+
 
         self.n_uniq_cols_ = self.unique_cols_.shape[1]
 
@@ -585,12 +602,12 @@ class BalsubramaniFreundClassifier(_BaseHeterogeneousEnsemble, ClassifierMixin):
                     self.cp_rhs_joint_conf_mat_[i*cm_len : (i + 1)*cm_len]\
                             = np.ravel(self.confusion_matrix_lb_[i])
 
-    def _make_constraint_lhs_and_rhs(self, predictions):
+    def _make_constraint_lhs_and_rhs(self, predictions, pattern_cts):
         """ Makes the C matrix from the new paper
         """
 
         # get patterns
-        self._get_prediction_patterns(predictions)
+        self._get_prediction_patterns(predictions, pattern_cts)
 
         # make C matrix now
         c_blocks = []
@@ -646,7 +663,7 @@ class BalsubramaniFreundClassifier(_BaseHeterogeneousEnsemble, ClassifierMixin):
         self.c_ = vstack(c_blocks, 'coo')
         self._make_constraint_rhs()
 
-    def _make_joint_cvx_prog_constraints(self, predictions, variables=None):
+    def _make_joint_cvx_prog_constraints(self, predictions, pattern_cts, variables=None):
         """ Makes the Balsubrani-Freund convex program like the new paper.
         """
         # set the comparison we want to use
@@ -655,7 +672,7 @@ class BalsubramaniFreundClassifier(_BaseHeterogeneousEnsemble, ClassifierMixin):
         else:
             oper = operator.ge
 
-        self._make_constraint_lhs_and_rhs(predictions)
+        self._make_constraint_lhs_and_rhs(predictions, pattern_cts)
 
         if self.constraint == 'accuracy':
             c_rhs = self.cp_rhs_accs_
@@ -692,7 +709,7 @@ class BalsubramaniFreundClassifier(_BaseHeterogeneousEnsemble, ClassifierMixin):
 
         return variables, constraints
 
-    def predict(self, X):
+    def predict(self, X, pattern_cts=None):
         """ A reference implementation of a prediction for a classifier.
 
         Parameters
@@ -709,12 +726,12 @@ class BalsubramaniFreundClassifier(_BaseHeterogeneousEnsemble, ClassifierMixin):
         # Check is fit had been called
         check_is_fitted(self)
 
-        y = self.predict_proba(X)
+        y = self.predict_proba(X, pattern_cts=pattern_cts)
         y = np.argmax(y, axis = 1)
 
         return self.le_.inverse_transform(y)
 
-    def predict_proba(self, X):
+    def predict_proba(self, X, pattern_cts=None):
         """ Solves the convex program and returns the computed probabilities.
 
         """
@@ -751,7 +768,7 @@ class BalsubramaniFreundClassifier(_BaseHeterogeneousEnsemble, ClassifierMixin):
             self.cp_var_preds_ = pred_vars
             self.cp_pred_constraints_ = constrs
         else:
-            pred_vars, constrs = self._make_joint_cvx_prog_constraints(predictions)
+            pred_vars, constrs = self._make_joint_cvx_prog_constraints(predictions, pattern_cts)
             self.cp_var_joint_preds_ = pred_vars
             self.cp_pred_constraints_ = constrs
 
