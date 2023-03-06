@@ -685,7 +685,7 @@ class BalsubramaniFreundClassifier(_BaseHeterogeneousEnsemble, ClassifierMixin):
                 (self.n_uniq_cols_, self.n_classes_), order='C'), axis=1) ==\
                 self.col_cts_ / self.n_samples_in_pred_x_
                 for i in range(variables.shape[1])]
-        cp_constraints += [cp.sum(cp.reshape(variables[:, i], \
+        constraints += [cp.sum(cp.reshape(variables[:, i], \
                 (self.n_uniq_cols_, self.n_classes_), order='C'), axis=0) ==\
                 self.class_freq_lb_
                 for i in range(variables.shape[1])]
@@ -794,12 +794,12 @@ class BalsubramaniFreundClassifier(_BaseHeterogeneousEnsemble, ClassifierMixin):
 
         if gt.ndim != 1:
             raise TypeError("Ground truth must be a 1D vector, but has"
-                    f"{gt.ndim} dimensions.")
+                    f"{gt.ndim} dimensions and shape {gt.shape}.")
         gt = self.le_.transform(gt)
-        gt_pattern = np.zeros(self.n_uniq_cols_, self.n_classes_)
+        gt_pattern = np.zeros((self.n_uniq_cols_, self.n_classes_))
 
         for i in range(self.n_uniq_cols_):
-            curr_col = self.n_uniq_cols_[:, i]
+            curr_col = self.unique_cols_[:, i]
             offset = self.col_uniq_inds_[i]
             pred_subset = self.predictions_[:, offset:]
             inds = np.argwhere([np.array_equiv(pred_subset[:, j], curr_col)
@@ -808,38 +808,59 @@ class BalsubramaniFreundClassifier(_BaseHeterogeneousEnsemble, ClassifierMixin):
                 gt_pattern[i, gt[offset + ind]] += 1
 
         if not joint_dist:
-            gt_pattern /= self.col_cts_
+            gt_pattern /= np.expand_dims(self.col_cts_, axis=1)
         else:
             gt_pattern /= np.sum(gt_pattern)
 
         return gt_pattern
 
-    def get_confidence_intervals(self):
+    def get_confidence_intervals(self, joint_dist=True):
         """
         Gets confidence intervals for each pattern.  Does this by solving
         2* tau, where tau is the total number of patterns
+
+        joint governs whether the confidence interval is for joint or
+        conditional distribution
         """
         if not self._check_has_predicted_joint():
             raise AttributeError("You must predict with prog_type='joint_com\
                     act' before you can compute confidence intervals.")
 
-        conf_int = np.zeros((self.n_uniq_cols_, self.n_classes_))
+        self.conf_int_ = np.zeros((self.n_uniq_cols_ * self.n_classes_, 2))
 
         #get constraints to form a program
         ci_vars, ci_constrs = self._make_joint_cvx_prog_constraints(self.predictions_)
-        selection = cp.Parameter(self.n_uniq_cols_)
-        self.cp_var_ci = ci_vars
-        self.cp_ci_constraints = ci_constrs
+        selection = cp.Parameter(self.n_uniq_cols_ * self.n_classes_)
+        self.cp_var_ci_ = ci_vars
+        self.cp_ci_constraints_ = ci_constrs
 
         lb_obj = cp.Minimize(selection.T @ ci_vars)
         ub_obj = cp.Maximize(selection.T @ ci_vars)
 
-        for j, obj in enumerate([lb_obj, ub_obj]):
-            for i in range(self.n_uniq_cols_):
-                selection.value = 0
-                selection[i].value = 1
-                prob = cp.Problem(obj, self.cp_ci_constraints)
-                prob.solve(solver=self.solver, verbose=self.verbose, warm_start=True)
-                conf_int[i, j] = prob.value
+        prob_lb = cp.Problem(lb_obj, self.cp_ci_constraints_)
+        prob_ub = cp.Problem(ub_obj, self.cp_ci_constraints_)
 
+        def helper(prob, ind):
+            basis_ind = np.zeros(selection.size)
+            basis_ind[ind] = 1
+            selection.value = basis_ind
+            prob.solve(solver=self.solver, verbose=self.verbose, warm_start=True)
 
+            return prob.value
+
+        for i, prob in enumerate([prob_lb, prob_ub]):
+            self.conf_int_[:, i] = Parallel(n_jobs=self.n_jobs)(
+                    delayed(helper)(prob, ind)
+                    for ind in range(self.n_uniq_cols_ * self.n_classes_))
+
+        # do cleanup so we don't have negative lower bounds and upperbounds
+        # that are greater than what's possible.
+        pattern_dist = np.expand_dims(self.col_cts_ / np.sum(self.col_cts_), axis=1)
+        #self.conf_int_[:, 0] = np.maximum(self.conf_int_[:, 0], 0)
+        #self.conf_int_[:, 1] = np.minimum(self.conf_int_[:, 1].reshape(self.n_uniq_cols_, self.n_classes_), pattern_dist).reshape(self.n_uniq_cols_ * self.n_classes_)
+
+        if not joint_dist:
+            for i in range(2):
+                self.conf_int_[:, i] = (self.conf_int_[:, i].reshape(self.n_uniq_cols_, self.n_classes_) / pattern_dist).reshape(self.n_uniq_cols_ * self.n_classes_)
+
+        return self.conf_int_
