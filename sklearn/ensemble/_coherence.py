@@ -768,7 +768,9 @@ class BalsubramaniFreundClassifier(_BaseHeterogeneousEnsemble, ClassifierMixin):
             self.cp_var_preds_ = pred_vars
             self.cp_pred_constraints_ = constrs
         else:
-            pred_vars, constrs = self._make_joint_cvx_prog_constraints(predictions, pattern_cts=pattern_cts)
+            pred_vars_row, constrs = self._make_joint_cvx_prog_constraints(predictions, pattern_cts=pattern_cts)
+            # reshape pred vars to make it consistent
+            pred_vars = cp.reshape(pred_vars_row, (self.n_uniq_cols_, self.n_classes_), order='C')
             self.cp_var_joint_preds_ = pred_vars
             self.cp_pred_constraints_ = constrs
 
@@ -783,9 +785,17 @@ class BalsubramaniFreundClassifier(_BaseHeterogeneousEnsemble, ClassifierMixin):
 
         # solve problem
         problem.solve(solver=self.solver, verbose=self.verbose)
+        self.objective_value_ = problem.value
+
+        if self.prog_type == 'joint_compact':
+            self.objective_value_ *= self.n_samples_in_pred_x_
 
         # retrieve and return solution
-        probs = np.reshape(pred_vars.value, (self.n_uniq_cols_, self.n_classes_))
+        if self.prog_type == 'orig':
+            probs = pred_vars.value
+        elif self.prog_type == 'joint_compact':
+            probs = pred_vars.value
+            #probs = np.reshape(pred_vars.value, (self.n_uniq_cols_, self.n_classes_))
 
         # convert back from pattern to actual datapoints
         if self.prog_type == 'joint_compact':
@@ -806,8 +816,8 @@ class BalsubramaniFreundClassifier(_BaseHeterogeneousEnsemble, ClassifierMixin):
         of all elemennts will sum to 1.
         """
         if not self._check_has_predicted_joint():
-            raise AttributeError("You must predict with prog_type='joint_com\
-                    act' before you can convert the ground truth.")
+            raise AttributeError("You must predict with prog_type='joint_com"
+                    "pact' before you can convert the ground truth.")
 
         if gt.ndim != 1:
             raise TypeError("Ground truth must be a 1D vector, but has"
