@@ -60,16 +60,6 @@ class BalsubramaniFreundClassifier(_BaseHeterogeneousEnsemble, ClassifierMixin):
         Determines whether the convex program constraints will be 'accuracy'
         (1 constraint per classifier), 'class_accuracy' (k constraints per
         classifier), or 'confusion_matrix' (k^2 constraints per classifier).
-    use_equality_constraints : {True, False}, default=False
-        Whether to use equality constraints in the convex program, i.e. do we
-        know the exact accuracy and the class distribution of the dataset we
-        want to predict on.
-    prog_type : {'orig', 'joint_compact'},\
-                 default='joint_compact'
-        ``orig`` gives the convex program presented by Balsubramani & Freund,
-        which is good when you may increase classifiers but not datapoints,
-        ``joint_compact`` gives the convex program where duplicate points,
-        i.e. ones with the same ensemble predictions are removed, while
     prefit : {True, False}, default=False
         Whether or not the `estimators` provided have already been fitted.  If
         set to True, the estimators will not be refitted.
@@ -116,8 +106,6 @@ class BalsubramaniFreundClassifier(_BaseHeterogeneousEnsemble, ClassifierMixin):
         'loss': [StrOptions({'0-1', 'Xent'})],
         'constraint': [StrOptions({'accuracy', 'class_accuracy', \
                 'confusion_matrix'})],
-        'use_equality_constraints':['boolean'],
-        'prog_type': [StrOptions({'orig', 'joint_compact'})],
         'prefit': ['boolean'],
         'bound_type': [StrOptions({'wilson', 'agresti_coull','beta',\
                 'binom_est'}), None],
@@ -136,8 +124,6 @@ class BalsubramaniFreundClassifier(_BaseHeterogeneousEnsemble, ClassifierMixin):
         unknown_ensemble=False,
         loss='Xent',
         constraint='accuracy',
-        use_equality_constraints=False,
-        prog_type='joint_compact',
         prefit=False,
         bound_type='wilson',
         signif_lvl=0.05,
@@ -149,12 +135,10 @@ class BalsubramaniFreundClassifier(_BaseHeterogeneousEnsemble, ClassifierMixin):
         ):
 
         super().__init__(estimators=estimators)
-        self.estimators=estimators
+        self.estimators = estimators
         self.unknown_ensemble = unknown_ensemble
         self.loss = loss
         self.constraint = constraint
-        self.use_equality_constraints = use_equality_constraints
-        self.prog_type = prog_type
         self.prefit = prefit
         self.bound_type = bound_type
         self.signif_lvl = signif_lvl
@@ -183,14 +167,6 @@ class BalsubramaniFreundClassifier(_BaseHeterogeneousEnsemble, ClassifierMixin):
 
         return names, all_estimators
 
-    def _check_has_predicted_joint(self):
-        """
-        Check to see if a prediction has been made with a program with type
-        prog_type='joint_compact'
-        """
-
-        return hasattr(self, "cp_var_joint_preds_")
-
     def _validate_params(self):
         super()._validate_params()
 
@@ -207,9 +183,6 @@ class BalsubramaniFreundClassifier(_BaseHeterogeneousEnsemble, ClassifierMixin):
             raise ValueError("Must have non- None value for `estimators` "
                     "parameter when `unknown_ensemble`=False.")
 
-        if self.pred_type == 'prob' and self.prog_type == 'joint_compact':
-            raise ValueError(f"Program type {self.prog_type} must be used with\
-                    deterministic predictions, i.e. pred_type='determ'")
         return self
 
     def _get_prediction_patterns(self, predictions, pattern_cts=None):
@@ -237,7 +210,6 @@ class BalsubramaniFreundClassifier(_BaseHeterogeneousEnsemble, ClassifierMixin):
                 self.col_uniq_inds_[i + 1] = new_ind
                 self.col_inv_[offset:new_ind] = np.array([i] * pattern_cts[i])
                 offset += pattern_cts[i]
-
 
         self.n_uniq_cols_ = self.unique_cols_.shape[1]
 
@@ -359,7 +331,7 @@ class BalsubramaniFreundClassifier(_BaseHeterogeneousEnsemble, ClassifierMixin):
         # counts to probabilities.
         num_samples = _num_samples(X)
 
-        # perform lower bounding if asked for
+        # perform bounding if asked for
         self.class_freq_est_ = self.class_freq_cts_ / y.size
         if self.constraint == 'accuracy':
             self.accuracy_est_ = self.accuracy_counts_ / num_samples
@@ -394,8 +366,10 @@ class BalsubramaniFreundClassifier(_BaseHeterogeneousEnsemble, ClassifierMixin):
 
     def fit_unknown_ensemble(
             self,
-            estimator_params,
-            class_freqs,
+            estimator_params_lb,
+            estimator_params_ub,
+            class_freqs_lb,
+            class_freqs_ub,
             classes,
             n_estimators,
             ):
@@ -421,122 +395,123 @@ class BalsubramaniFreundClassifier(_BaseHeterogeneousEnsemble, ClassifierMixin):
         self.n_estimators_ = n_estimators
 
         # do consistency checks
-        if self.n_classes_ != len(class_freqs):
+        if len(class_freqs_lb) != len(class_freqs_ub):
+            raise ValueError('class_freqs_lb and class_freqs_ub have'
+                    'different lengths.')
+        if self.n_classes_ != len(class_freqs_lb):
             raise ValueError(f'{self.n_classes_} classes, yet there are '
-                    f'{len(class_freqs)} many class frequencies.')
-        if self.n_estimators_ != len(estimator_params):
+                    f'{len(class_freqs_lb)} many class frequencies.')
+        if len(estimator_params_lb) != len(estimator_params_ub):
+            raise ValueError('estimator_params_lb and estimator_params_ub'
+                    'have different lengths.')
+        if self.n_estimators_ != len(estimator_params_lb):
             raise ValueError(f'{self.n_estimators_} estimators, yet there are '
-                    f'{len(estimator_params)} many sets of estimator '
+                    f'{len(estimator_params_lb)} many sets of estimator '
                     'parameters.')
 
         # no need to check when using accuracies since the check is the same
         # as above
         if self.constraint == 'class_accuracy':
             for i in range(self.n_estimators_):
-                if len(estimator_params[i]) != self.n_classes_:
+                if len(estimator_params_lb[i]) != self.n_classes_ or \
+                        len(estimator_params_ub[i]) != self.n_classes_:
                     raise ValueError(f"Estimator {i} has "
-                            f"{len(estimator_params[i])} class accuracies, "
+                            f"{len(estimator_params_lb[i])} lower bounded"
+                            " class accuracies and "
+                            f"{len(estimator_params_ub[i])} upper bounded"
+                            "class accuracies, "
                             f"rather than the expected {self.n_classes_}")
         elif self.constraint == 'confusion_matrix':
             for i in range(self.n_estimators_):
-                if estimator_params[i].shape !=\
+                if estimator_params_lb[i].shape !=\
+                        (self.n_classes_, self.n_classes_) or \
+                        estimator_params_ub[i].shape !=\
                         (self.n_classes_, self.n_classes_):
-                    raise ValueError(f"Estimator {i} has confusion matrix of "
-                            f"size {estimator_params[i].shape}, "
+                    raise ValueError(f"Estimator {i} has confusion matrix lower"
+                            f"bound of size size {estimator_params_lb[i].shape}"
+                            " and confusion matrix upper bound of size "
+                            f"{estimator_params_ub[i].shape} "
                             f"rather than the expected ({self.n_classes_}, "
                             f"{self.n_classes_}).")
 
-        self.class_freq_lb_ = class_freqs
+        self.class_freq_lb_ = class_freqs_lb
+        self.class_freq_ub_ = class_freqs_ub
 
         if self.constraint == 'accuracy':
-            self.accuracy_lb_ = estimator_params
+            self.accuracy_lb_ = estimator_params_lb
+            self.accuracy_ub_ = estimator_params_ub
         elif self.constraint == 'class_accuracy':
-            self.class_accuracy_lb_ = estimator_params
+            self.class_accuracy_lb_ = estimator_params_lb
+            self.class_accuracy_ub_ = estimator_params_ub
         elif self.constraint == 'confusion_matrix':
-            self.confusion_matrix_lb_ = estimator_params
+            self.confusion_matrix_lb_ = estimator_params_lb
+            self.confusion_matrix_ub_ = estimator_params_ub
 
         self._validate_cvx_program_params()
 
         return self
 
-    def _make_orig_cvx_prog_constraints(self, predictions):
-        """ Makes the Balsubrani-Freund convex program a la the original paper.
+    def _make_primal_cp_rhs(self):
         """
-        constraints = []
-
+        Make the right hand side constraints
+        """
         if self.use_parameters:
-            #assign parameters to rhs
-            if self.use_equality_constraints:
-                self.cp_rhs_class_freq_est_ = cp.Parameter(self.n_classes_, nonneg=True)
-                self.cp_rhs_class_freq_est_.value = self.class_freq_est_
+            self.cp_rhs_class_freq_lb_ = cp.Parameter(self.n_classes_, nonneg=True)
+            self.cp_rhs_class_freq_ub_ = cp.Parameter(self.n_classes_, nonneg=True)
+            self.cp_rhs_class_freq_lb_.value = self.class_freq_lb_
+            self.cp_rhs_class_freq_ub_.value = self.class_freq_ub_
 
-                if self.constraint == 'accuracy':
-                    self.cp_rhs_accs_est_ = cp.Parameter(self.n_estimators_, nonneg=True)
-                    self.cp_rhs_accs_est_.value = self.accuracy_est_
-                elif self.constraint == 'class_accuracy':
-                    self.cp_rhs_class_accuracies_est_ = cp.Parameter(self.n_estimators_ * self.n_classes_, nonneg=True)
-                    for i in range(self.n_estimators_):
-                        self.cp_rhs_class_accuracies_est_[i * self.n_classes_ : (i + 1) * self.n_classes_].value = self.class_accuracy_est_[i]
-                else:
-                    # number of entries in a confusion matrix
-                    cm_len = np.power(self.n_classes_, 2)
-                    self.cp_rhs_confusion_matrix_est_ = cp.Parameter(self.n_estimators_ *\
-                            cm_len, nonneg=True)
-                    for i in range(self.n_estimators_):
-                        self.cp_rhs_confusion_matrix_est_[i * cm_len : (i + 1) * cm_len].value = np.ravel(self.confusion_matrix_est_[i])
+        if self.constraint == 'accuracy':
+            if self.use_parameters:
+                self.cp_rhs_classifier_lb_ = cp.Parameter(self.n_estimators_, nonneg=True)
+                self.cp_rhs_classifier_ub_ = cp.Parameter(self.n_estimators_, nonneg=True)
+                self.cp_rhs_classifier_lb_.value = self.accuracy_lb_
+                self.cp_rhs_classifier_ub_.value = self.accuracy_ub_
             else:
-                self.cp_rhs_class_freq_lb_ = cp.Parameter(self.n_classes_, nonneg=True)
-                self.cp_rhs_class_freq_lb_.value = self.class_freq_lb_
-                self.cp_rhs_class_freq_ub_ = cp.Parameter(self.n_classes_, nonneg=True)
-                self.cp_rhs_class_freq_ub_.value = self.class_freq_ub_
+                self.cp_rhs_classifier_lb_ = self.accuracy_lb_
+                self.cp_rhs_classifier_ub_ = self.accuracy_ub_
 
-                if self.constraint == 'accuracy':
-                    self.cp_rhs_accs_lb_ = cp.Parameter(self.n_estimators_, nonneg=True)
-                    self.cp_rhs_accs_lb_.value = self.accuracy_lb_
-                    self.cp_rhs_accs_ub_ = cp.Parameter(self.n_estimators_, nonneg=True)
-                    self.cp_rhs_accs_ub_.value = self.accuracy_ub_
-                elif self.constraint == 'class_accuracy':
-                    self.cp_rhs_class_accuracies_lb_ = cp.Parameter(self.n_estimators_ * self.n_classes_, nonneg=True)
-                    self.cp_rhs_class_accuracies_ub_ = cp.Parameter(self.n_estimators_ * self.n_classes_, nonneg=True)
-                    for i in range(self.n_estimators_):
-                        self.cp_rhs_class_accuracies_lb_[i * self.n_classes_ : (i + 1) * self.n_classes_].value = self.class_accuracy_lb_[i]
-                        self.cp_rhs_class_accuracies_ub_[i * self.n_classes_ : (i + 1) * self.n_classes_].value = self.class_accuracy_ub_[i]
-                else:
-                    # number of entries in a confusion matrix
-                    cm_len = np.power(self.n_classes_, 2)
-                    self.cp_rhs_confusion_matrix_lb_ = cp.Parameter(self.n_estimators_ *\
-                            cm_len, nonneg=True)
-                    self.cp_rhs_confusion_matrix_ub_ = cp.Parameter(self.n_estimators_ *\
-                            cm_len, nonneg=True)
-                    for i in range(self.n_estimators_):
-                        self.cp_rhs_confusion_matrix_lb_[i * cm_len : (i + 1) * cm_len] = np.ravel(self.confusion_matrix_lb_[i])
-                        self.cp_rhs_confusion_matrix_ub_[i * cm_len : (i + 1) * cm_len] = np.ravel(self.confusion_matrix_ub_[i])
-
+        elif self.constraint == 'class_accuracy':
+            if self.use_parameters:
+                self.cp_rhs_classifier_lb_ = cp.Parameter(self.n_estimators_ * self.n_classes_, nonneg=True)
+                self.cp_rhs_classifier_ub_ = cp.Parameter(self.n_estimators_ * self.n_classes_, nonneg=True)
+                for i in range(self.n_estimators_):
+                    self.cp_rhs_classifier_lb_[i * self.n_classes_ : (i + 1) * self.n_classes_].value = self.class_accuracy_lb_[i]
+                    self.cp_rhs_classifier_ub_[i * self.n_classes_ : (i + 1) * self.n_classes_].value = self.class_accuracy_ub_[i]
+            else:
+                self.cp_rhs_classifier_lb_ = np.zeros(self.n_estimators_ * self.n_classes_)
+                self.cp_rhs_classifier_ub_ = np.zeros(self.n_estimators_ * self.n_classes_)
+                for i in range(self.n_estimators_):
+                    self.cp_rhs_classifier_lb_[i * self.n_classes_ : (i + 1) * self.n_classes_] = self.class_accuracy_lb_[i]
+                    self.cp_rhs_classifier_ub_[i * self.n_classes_ : (i + 1) * self.n_classes_] = self.class_accuracy_ub_[i]
         else:
-            #set RHS to usual suspects
-            if self.use_equality_constraints:
-                self.cp_rhs_class_freq_est_ = self.class_freq_est_
-
-                if self.constraint == 'accuracy':
-                    self.cp_rhs_accs_est_ = self.accuracy_est_
-                elif self.constraint == 'class_accuracy':
-                    self.cp_rhs_class_accuracies_est_ = self.class_accuracy_est_
-                else:
-                    self.cp_rhs_confusion_matrix_est_ = self.confusion_matrix_est_
+            # number of entries in a confusion matrix
+            cm_len = np.power(self.n_classes_, 2)
+            if self.use_parameters:
+                self.cp_rhs_classifier_lb_ = cp.Parameter(self.n_estimators_ *\
+                        cm_len, nonneg=True)
+                self.cp_rhs_classifier_ub_ = cp.Parameter(self.n_estimators_ *\
+                        cm_len, nonneg=True)
+                for i in range(self.n_estimators_):
+                    self.cp_rhs_classifier_lb_[i * cm_len : (i + 1) * cm_len].value = np.ravel(self.confusion_matrix_lb_[i])
+                    self.cp_rhs_classifier_ub_[i * cm_len : (i + 1) * cm_len].value = np.ravel(self.confusion_matrix_ub_[i])
             else:
-                self.cp_rhs_class_freq_lb_ = self.class_freq_lb_
-                self.cp_rhs_class_freq_ub_ = self.class_freq_ub_
+                self.cp_rhs_classifier_lb_ = np.zeros(self.n_estimators_ *\
+                        cm_len)
+                self.cp_rhs_classifier_ub_ = np.zeros(self.n_estimators_ *\
+                        cm_len)
+                for i in range(self.n_estimators_):
+                    self.cp_rhs_classifier_lb_[i * cm_len : (i + 1) * cm_len] = np.ravel(self.confusion_matrix_lb_[i])
+                    self.cp_rhs_classifier_ub_[i * cm_len : (i + 1) * cm_len] = np.ravel(self.confusion_matrix_ub_[i])
 
-                if self.constraint == 'accuracy':
-                    self.cp_rhs_accs_lb_ = self.accuracy_lb_
-                    self.cp_rhs_accs_ub_ = self.accuracy_ub_
-                elif self.constraint == 'class_accuracy':
-                    self.cp_rhs_class_accuracies_lb_ = self.class_accuracy_lb_
-                    self.cp_rhs_class_accuracies_ub_ = self.class_accuracy_ub_
-                else:
-                    self.cp_rhs_confusion_matrix_lb_ = self.confusion_matrix_lb_
-                    self.cp_rhs_confusion_matrix_ub_ = self.confusion_matrix_ub_
+    def _make_primal_cp_constraints(self, variables, predictions):
+        """
+        Make primal convex program constraints
+        """
 
+        self._make_primal_cp_rhs()
+
+        constraints = []
         # convert predictions into 1 hot encoding and make the resulting
         # matrix sparse if deterministic predictions.
         if self.pred_type == 'determ':
@@ -548,297 +523,53 @@ class BalsubramaniFreundClassifier(_BaseHeterogeneousEnsemble, ClassifierMixin):
                     self.oh_le_.transform(prediction.reshape(-1,1)).toarray()
                     for prediction in predictions]
 
-        variables = cp.Variable((self.n_samples_in_pred_x_, self.n_classes_))
 
         for i in range(self.n_estimators_):
             prediction_mass = np.sum(predictions[i])
-            if self.constraint == 'accuracy':
-                if self.use_equality_constraints:
-                    constraints.append(
-                        cp.sum(cp.multiply(predictions[i], variables)) == \
-                        self.cp_rhs_accs_est_[i] * prediction_mass)
-                else:
-                    constraints.append(
-                        cp.sum(cp.multiply(predictions[i], variables)) >= \
-                        self.cp_rhs_accs_lb_[i] * prediction_mass)
-                    constraints.append(
-                        cp.sum(cp.multiply(predictions[i], variables)) <= \
-                        self.cp_rhs_accs_ub_[i] * prediction_mass)
+            # compute the confusion matrix constraint LHS
+            conf_mat_var_sums = variables.T @ predictions[i]
 
+            if self.constraint == 'accuracy':
+                acc_var_sums = cp.trace(conf_mat_var_sums)
+                constraints.append(acc_var_sums >= \
+                    self.cp_rhs_classifier_lb_[i] * prediction_mass)
+                constraints.append(acc_var_sums <= \
+                    self.cp_rhs_classifier_ub_[i] * prediction_mass)
+
+            elif self.constraint == 'class_accuracy':
+                class_acc_var_sums = cp.diag(conf_mat_var_sums)
+                constraints.append(class_acc_var_sums >=\
+                    self.cp_rhs_classifier_lb_[i] * prediction_mass)
+                constraints.append(class_acc_var_sums <=\
+                        self.cp_rhs_classifier_ub_[i] * prediction_mass)
             else:
                 # Convert the confusion matrix into a matrix dealing with
                 # joint probabilities, Pr(Y, h_i(X)) since when confusion
                 # matrix entries are estimated via labeled data, we are
                 # estimating Pr(Y | h_i(X)).  This is done by multiplying the
                 # lower bounded class frequencies, one class per row.
-
                 cm_len = np.power(self.n_classes_, 2)
-                conf_mat_var_sums = variables.T @ predictions[i]
-                if self.constraint == 'class_accuracy':
-                    class_acc_var_sums = cp.diag(conf_mat_var_sums)
-                    if self.use_equality_constraints:
-                        constraints.append(class_acc_var_sums ==\
-                                self.cp_rhs_class_accuracies_est_[i] * prediction_mass)
-                    else:
-                        constraints.append(class_acc_var_sums >=\
-                                self.cp_rhs_class_accuracies_lb_[i] * prediction_mass)
-                        constraints.append(class_acc_var_sums <=\
-                                self.cp_rhs_class_accuracies_ub_[i] * prediction_mass)
-
-                else:
-                    lhs_ravel = cp.reshape(conf_mat_var_sums, (cm_len, 1), order='C')
-                    if self.use_equality_constraints:
-                        rhs_est_ravel = cp.reshape(self.cp_rhs_confusion_matrix_est_[i] *\
-                            prediction_mass, (cm_len, 1), order='C')
-                        constraints.append(lhs_ravel == rhs_est_ravel)
-                    else:
-                        rhs_lb_ravel = cp.reshape(self.cp_rhs_confusion_matrix_lb_[i] *\
-                                prediction_mass, (cm_len, 1), order='C')
-                        rhs_ub_ravel = cp.reshape(self.cp_rhs_confusion_matrix_ub_[i] *\
-                                prediction_mass, (cm_len, 1), order='C')
-                        constraints.append(lhs_ravel >= rhs_lb_ravel)
-                        constraints.append(lhs_ravel <= rhs_ub_ravel)
+                lhs_ravel = cp.reshape(conf_mat_var_sums, (cm_len, 1), order='C')
+                rhs_lb_ravel = cp.reshape(self.cp_rhs_classifier_lb_[i] *\
+                        prediction_mass, (cm_len, 1), order='C')
+                rhs_ub_ravel = cp.reshape(self.cp_rhs_classifier_ub_[i] *\
+                        prediction_mass, (cm_len, 1), order='C')
+                constraints.append(lhs_ravel >= rhs_lb_ravel)
+                constraints.append(lhs_ravel <= rhs_ub_ravel)
 
         # make class frequency constraints
-        if self.use_equality_constraints:
-            constraints.append(cp.sum(variables, axis=0) == \
-                self.class_freq_est_ * self.n_samples_in_pred_x_)
-        else:
-            constraints.append(cp.sum(variables, axis=0) >= \
-                self.class_freq_lb_ * self.n_samples_in_pred_x_)
-            constraints.append(cp.sum(variables, axis=0) <= \
-                self.class_freq_ub_ * self.n_samples_in_pred_x_)
+        constraints.append(cp.sum(variables, axis=0) >= \
+            self.class_freq_lb_ * self.n_samples_in_pred_x_)
+        constraints.append(cp.sum(variables, axis=0) <= \
+            self.class_freq_ub_ * self.n_samples_in_pred_x_)
 
         # enforce each prediction being a probability distribution
         constraints += [cp.sum(variables, axis=1) == 1,
                 variables >= 0]
 
-        return variables, constraints
+        return constraints
 
-    def _make_constraint_rhs(self):
-        """ Makes the RHS to the C matrix from the new paper
-        """
-
-        if self.use_parameters:
-            #assign parameters to rhs
-            if self.use_equality_constraints:
-                self.cp_rhs_class_freq_est_ = cp.Parameter(self.n_classes_, nonneg=True)
-                self.cp_rhs_class_freq_est_.value = self.class_freq_est_
-
-                if self.constraint == 'accuracy':
-                    self.cp_rhs_accs_est_ = cp.Parameter(self.n_estimators_, nonneg=True)
-                    self.cp_rhs_accs_est_.value = self.accuracy_est_
-                elif self.constraint == 'class_accuracy':
-                    self.cp_rhs_class_accuracies_est_ = cp.Parameter(self.n_estimators_ * self.n_classes_, nonneg=True)
-                    for i in range(self.n_estimators_):
-                        self.cp_rhs_class_accuracies_est_[i * self.n_classes_ : (i + 1) * self.n_classes_].value = self.class_accuracy_est_[i]
-                else:
-                    # number of entries in a confusion matrix
-                    cm_len = np.power(self.n_classes_, 2)
-                    self.cp_rhs_confusion_matrix_est_ = cp.Parameter(self.n_estimators_ *\
-                            cm_len, nonneg=True)
-                    for i in range(self.n_estimators_):
-                        self.cp_rhs_confusion_matrix_est_[i * cm_len : (i + 1) * cm_len].value = np.ravel(self.confusion_matrix_est_[i])
-            else:
-                self.cp_rhs_class_freq_lb_ = cp.Parameter(self.n_classes_, nonneg=True)
-                self.cp_rhs_class_freq_lb_.value = self.class_freq_lb_
-                self.cp_rhs_class_freq_ub_ = cp.Parameter(self.n_classes_, nonneg=True)
-                self.cp_rhs_class_freq_ub_.value = self.class_freq_ub_
-
-                if self.constraint == 'accuracy':
-                    self.cp_rhs_accs_lb_ = cp.Parameter(self.n_estimators_, nonneg=True)
-                    self.cp_rhs_accs_lb_.value = self.accuracy_lb_
-                    self.cp_rhs_accs_ub_ = cp.Parameter(self.n_estimators_, nonneg=True)
-                    self.cp_rhs_accs_ub_.value = self.accuracy_ub_
-                elif self.constraint == 'class_accuracy':
-                    self.cp_rhs_class_accuracies_lb_ = cp.Parameter(self.n_estimators_ * self.n_classes_, nonneg=True)
-                    self.cp_rhs_class_accuracies_ub_ = cp.Parameter(self.n_estimators_ * self.n_classes_, nonneg=True)
-                    for i in range(self.n_estimators_):
-                        self.cp_rhs_class_accuracies_lb_[i * self.n_classes_ : (i + 1) * self.n_classes_].value = self.class_accuracy_lb_[i]
-                        self.cp_rhs_class_accuracies_ub_[i * self.n_classes_ : (i + 1) * self.n_classes_].value = self.class_accuracy_ub_[i]
-                else:
-                    # number of entries in a confusion matrix
-                    cm_len = np.power(self.n_classes_, 2)
-                    self.cp_rhs_confusion_matrix_lb_ = cp.Parameter(self.n_estimators_ *\
-                            cm_len, nonneg=True)
-                    self.cp_rhs_confusion_matrix_ub_ = cp.Parameter(self.n_estimators_ *\
-                            cm_len, nonneg=True)
-                    for i in range(self.n_estimators_):
-                        self.cp_rhs_confusion_matrix_lb_[i * cm_len : (i + 1) * cm_len] = np.ravel(self.confusion_matrix_lb_[i])
-                        self.cp_rhs_confusion_matrix_ub_[i * cm_len : (i + 1) * cm_len] = np.ravel(self.confusion_matrix_ub_[i])
-        else:
-            #set RHS to usual suspects
-            if self.use_equality_constraints:
-                self.cp_rhs_class_freq_est_ = self.class_freq_est_
-
-                if self.constraint == 'accuracy':
-                    self.cp_rhs_accs_est_ = self.accuracy_est_
-                elif self.constraint == 'class_accuracy':
-                    self.cp_rhs_class_accs_est_ = np.zeros(self.n_estimators_ * self.n_classes_)
-                    for i in range(self.n_estimators_):
-                        self.cp_rhs_class_accs_est_[i * self.n_classes_ : (i + 1) * self.n_classes_] = self.class_accuracy_est_[i]
-                else:
-                    self.cp_rhs_confusion_matrix_est_ = self.confusion_matrix_est_
-            else:
-                self.cp_rhs_class_freq_lb_ = self.class_freq_lb_
-                self.cp_rhs_class_freq_ub_ = self.class_freq_ub_
-
-                if self.constraint == 'accuracy':
-                    self.cp_rhs_accs_lb_ = self.accuracy_lb_
-                    self.cp_rhs_accs_ub_ = self.accuracy_ub_
-                elif self.constraint == 'class_accuracy':
-                    self.cp_rhs_class_accs_lb_ = np.zeros(self.n_estimators_ * self.n_classes_)
-                    self.cp_rhs_class_accs_ub_ = np.zeros(self.n_estimators_ * self.n_classes_)
-                    for i in range(self.n_estimators_):
-                        self.cp_rhs_class_accs_lb_[i * self.n_classes_ : (i + 1) * self.n_classes_] = self.class_accuracy_lb_[i]
-                    for i in range(self.n_estimators_):
-                        self.cp_rhs_class_accs_ub_[i * self.n_classes_ : (i + 1) * self.n_classes_] = self.class_accuracy_ub_[i]
-                else:
-                    cm_len = np.power(self.n_classes_, 2)
-                    self.cp_rhs_conf_mat_lb_ = np.zeros(self.n_estimators_ *\
-                            cm_len)
-                    self.cp_rhs_conf_mat_ub_ = np.zeros(self.n_estimators_ *\
-                            cm_len)
-                    for i in range(self.n_estimators_):
-                        self.cp_rhs_conf_mat_lb_[i*cm_len : (i + 1)*cm_len]\
-                                = np.ravel(self.confusion_matrix_lb_[i])
-                        self.cp_rhs_conf_mat_ub_[i*cm_len : (i + 1)*cm_len]\
-                                = np.ravel(self.confusion_matrix_ub_[i])
-
-    def _make_constraint_lhs_and_rhs(self, predictions, pattern_cts=None):
-        """ Makes the C matrix from the new paper
-        """
-
-        # get patterns
-        self._get_prediction_patterns(predictions, pattern_cts=pattern_cts)
-
-        # make C matrix now
-        c_blocks = []
-        for i in range(self.n_estimators_):
-            if self.constraint == 'accuracy':
-                preds = self.unique_cols_[i, :].reshape(-1, 1)
-                col = []
-
-                for j in range(self.n_uniq_cols_):
-                    col.append(j * self.n_classes_ + preds[j,0])
-
-                col = np.array(col)
-                row = np.array([0] * len(col))
-                data = np.array([1] * len(col))
-                C = coo_array((data, (row, col)), shape=(1, self.n_uniq_cols_ * self.n_classes_))
-                #c_blocks.append(preds_one_hot)
-                c_blocks.append(C)
-
-            elif self.constraint == 'class_accuracy':
-                # construct a sparse matrix for every classifier
-                row = []
-                col = []
-
-                for j in range(self.n_uniq_cols_):
-                    row.append(self.unique_cols_[i, j])
-                    col.append(j * self.n_classes_ + self.unique_cols_[i, j])
-
-                row = np.array(row)
-                col = np.array(col)
-                data = [1] * len(row)
-                C = coo_array((data, (row, col)),
-                        shape=(self.n_classes_, self.n_uniq_cols_ * self.n_classes_))
-                c_blocks.append(C)
-
-            else:
-                # l ranges through the true classes
-                for l in range(self.n_classes_):
-                    # construct a sparse matrix for every classifier
-                    row = []
-                    col = []
-
-                    for j in range(self.n_uniq_cols_):
-                        row.append(self.unique_cols_[i, j])
-                        col.append(j * self.n_classes_ + l)
-
-                    row = np.array(row)
-                    col = np.array(col)
-                    data = [1] * len(row)
-                    C = coo_array((data, (row, col)), shape=\
-                            (self.n_classes_, self.n_uniq_cols_ * self.n_classes_))
-                    c_blocks.append(C)
-
-        self.c_ = vstack(c_blocks, 'coo')
-        self._make_constraint_rhs()
-
-    def _make_joint_cvx_prog_constraints(self, predictions, pattern_cts=None, variables=None):
-        """ Makes the Balsubrani-Freund convex program like the new paper.
-        """
-
-        self._make_constraint_lhs_and_rhs(predictions, pattern_cts=pattern_cts)
-
-        if self.use_equality_constraints:
-            if self.constraint == 'accuracy':
-                c_rhs = self.cp_rhs_accs_est_
-            elif self.constraint == 'class_accuracy':
-                c_rhs = self.cp_rhs_class_accs_est_
-            else:
-                c_rhs = self.cp_rhs_confusion_matrix_est_
-        else:
-            if self.constraint == 'accuracy':
-                c_rhs_lb = self.cp_rhs_accs_lb_
-                c_rhs_ub = self.cp_rhs_accs_ub_
-            elif self.constraint == 'class_accuracy':
-                c_rhs_lb = self.cp_rhs_class_accs_lb_
-                c_rhs_ub = self.cp_rhs_class_accs_ub_
-            else:
-                c_rhs_lb = self.cp_rhs_conf_mat_lb_
-                c_rhs_ub = self.cp_rhs_conf_mat_ub_
-
-        # pad out the dimensions of c_rhs to deal with case where variables
-        # is two dimensional
-        if self.use_equality_constraints:
-            c_rhs = np.expand_dims(c_rhs, axis=1)
-        else:
-            c_rhs_lb = np.expand_dims(c_rhs_lb, axis=1)
-            c_rhs_ub = np.expand_dims(c_rhs_ub, axis=1)
-
-        if variables is None:
-            variables = cp.Variable((self.n_uniq_cols_ *\
-                self.n_classes_, 1))
-
-        constraints = []
-
-        if self.use_equality_constraints:
-            constraints.append(self.c_ @ variables == c_rhs)
-        else:
-            constraints.append(self.c_ @ variables >= c_rhs_lb)
-            constraints.append(self.c_ @ variables <= c_rhs_ub)
-
-        # enforce that the predictions form a probability distribution
-        constraints += [variables >= 0,
-                cp.sum(variables, axis=0) == 1]
-
-        # make the constraints that every model will have, i.e. enforcing
-        # class frequencies and distribution of patterns.
-        constraints += [cp.sum(cp.reshape(variables[:, i], \
-                (self.n_uniq_cols_, self.n_classes_), order='C'), axis=1) ==\
-                self.col_cts_ / self.n_samples_in_pred_x_
-                for i in range(variables.shape[1])]
-
-        if self.use_equality_constraints:
-            constraints += [cp.sum(cp.reshape(variables[:, i], \
-                    (self.n_uniq_cols_, self.n_classes_), order='C'), axis=0) ==\
-                    self.class_freq_est_
-                    for i in range(variables.shape[1])]
-        else:
-            constraints += [cp.sum(cp.reshape(variables[:, i], \
-                    (self.n_uniq_cols_, self.n_classes_), order='C'), axis=0) >=\
-                    self.class_freq_lb_
-                    for i in range(variables.shape[1])]
-            constraints += [cp.sum(cp.reshape(variables[:, i], \
-                    (self.n_uniq_cols_, self.n_classes_), order='C'), axis=0) <=\
-                    self.class_freq_ub_
-                    for i in range(variables.shape[1])]
-
-        return variables, constraints
-
-    def predict(self, X, pattern_cts=None):
+    def predict(self, X):
         """ A reference implementation of a prediction for a classifier.
 
         Parameters
@@ -855,12 +586,12 @@ class BalsubramaniFreundClassifier(_BaseHeterogeneousEnsemble, ClassifierMixin):
         # Check is fit had been called
         check_is_fitted(self)
 
-        y = self.predict_proba(X, pattern_cts=pattern_cts)
+        y = self.predict_proba(X)
         y = np.argmax(y, axis = 1)
 
         return self.le_.inverse_transform(y)
 
-    def predict_proba(self, X, pattern_cts=None):
+    def predict_proba(self, X):
         """ Solves the convex program and returns the computed probabilities.
 
         """
@@ -892,16 +623,13 @@ class BalsubramaniFreundClassifier(_BaseHeterogeneousEnsemble, ClassifierMixin):
                     for estimator in self.estimators_
                     ]
 
-        if self.prog_type == 'orig':
-            pred_vars, constrs = self._make_orig_cvx_prog_constraints(predictions)
-            self.cp_var_preds_ = pred_vars
-            self.cp_pred_constraints_ = constrs
-        else:
-            pred_vars_row, constrs = self._make_joint_cvx_prog_constraints(predictions, pattern_cts=pattern_cts)
-            # reshape pred vars to make it consistent
-            pred_vars = cp.reshape(pred_vars_row, (self.n_uniq_cols_, self.n_classes_), order='C')
-            self.cp_var_joint_preds_ = pred_vars
-            self.cp_pred_constraints_ = constrs
+        self.predictions_ = predictions
+        self._get_prediction_patterns(self.predictions_)
+
+        pred_vars = cp.Variable((self.n_samples_in_pred_x_, self.n_classes_))
+        constrs = self._make_primal_cp_constraints(pred_vars, predictions)
+        self.cp_var_preds_ = pred_vars
+        self.cp_pred_constraints_ = constrs
 
         if self.loss == '0-1':
             self.cp_objective_ = cp.Minimize(cp.sum(
@@ -916,37 +644,15 @@ class BalsubramaniFreundClassifier(_BaseHeterogeneousEnsemble, ClassifierMixin):
         problem.solve(solver=self.solver, verbose=self.verbose)
         self.objective_value_ = problem.value
 
-        if self.prog_type == 'joint_compact':
-            self.objective_value_ *= self.n_samples_in_pred_x_
-
         # retrieve and return solution
-        if self.prog_type == 'orig':
-            probs = pred_vars.value
-        elif self.prog_type == 'joint_compact':
-            probs = pred_vars.value
-            #probs = np.reshape(pred_vars.value, (self.n_uniq_cols_, self.n_classes_))
-
-        # convert back from pattern to actual datapoints
-        if self.prog_type == 'joint_compact':
-            probs /= np.expand_dims(self.col_cts_, axis=1) / self.n_samples_in_pred_x_
-            probs = probs[self.col_inv_, :]
+        probs = pred_vars.value
 
         return probs
 
-    def convert_gt_to_pattern(self, gt, joint_dist=True):
+    def gt_pattern_average(self, gt, expand=True):
         """
-        Encodes the ground truth in terms of patterns, rather than all
-        datapoints.
-
-        Conditional means the ground truth will be a conditional distribution
-        of labels given the ensemble's prediction pattern.  Each row is
-        associated with a pattern and sum to 1
-        Joint will give the joint distribution of labels and patterns. The sum
-        of all elemennts will sum to 1.
+        Averages the label distribution according to ensemble patterns
         """
-        if not self._check_has_predicted_joint():
-            raise AttributeError("You must predict with prog_type='joint_com"
-                    "pact' before you can convert the ground truth.")
 
         if gt.ndim != 1:
             raise TypeError("Ground truth must be a 1D vector, but has"
@@ -963,14 +669,14 @@ class BalsubramaniFreundClassifier(_BaseHeterogeneousEnsemble, ClassifierMixin):
             for ind in inds:
                 gt_pattern[i, gt[offset + ind]] += 1
 
-        if not joint_dist:
-            gt_pattern /= np.expand_dims(self.col_cts_, axis=1)
+        gt_pattern /= np.expand_dims(self.col_cts_, axis=1)
+
+        if expand:
+            return gt_pattern[self.col_inv_, :]
         else:
-            gt_pattern /= np.sum(gt_pattern)
+            return gt_pattern
 
-        return gt_pattern
-
-    def get_confidence_intervals(self, joint_dist=True):
+    def get_confidence_intervals(self, expand=False):
         """
         Gets confidence intervals for each pattern.  Does this by solving
         2* tau, where tau is the total number of patterns
@@ -978,45 +684,60 @@ class BalsubramaniFreundClassifier(_BaseHeterogeneousEnsemble, ClassifierMixin):
         joint governs whether the confidence interval is for joint or
         conditional distribution
         """
-        if not self._check_has_predicted_joint():
-            raise AttributeError("You must predict with prog_type='joint_com\
-                    act' before you can compute confidence intervals.")
 
-        self.conf_int_ = np.zeros((self.n_uniq_cols_ * self.n_classes_, 2))
+        if self.pred_type != 'determ':
+            raise AttributeError('ensemble must predict deterministically to'
+                    'compute confidence intervals.')
+
+        self.conf_int_compact_ = np.zeros((self.n_uniq_cols_ * self.n_classes_, 2))
 
         #get constraints to form a program
-        ci_vars, ci_constrs = self._make_joint_cvx_prog_constraints(self.predictions_)
-        selection = cp.Parameter(self.n_uniq_cols_ * self.n_classes_)
+        ci_vars = cp.Variable((self.n_samples_in_pred_x_, self.n_classes_))
+        ci_constrs = self._make_primal_cp_constraints(ci_vars, self.predictions_)
+        selection = cp.Parameter(self.n_samples_in_pred_x_* self.n_classes_)
         self.cp_var_ci_ = ci_vars
         self.cp_ci_constraints_ = ci_constrs
-
-        lb_obj = cp.Minimize(selection.T @ ci_vars)
-        ub_obj = cp.Maximize(selection.T @ ci_vars)
+        lb_obj = cp.Minimize(selection.T @ cp.reshape(ci_vars, (self.n_samples_in_pred_x_ * self.n_classes_, 1), order='C'))
+        ub_obj = cp.Maximize(selection.T @ cp.reshape(ci_vars, (self.n_samples_in_pred_x_ * self.n_classes_, 1), order='C'))
 
         prob_lb = cp.Problem(lb_obj, self.cp_ci_constraints_)
         prob_ub = cp.Problem(ub_obj, self.cp_ci_constraints_)
 
-        def helper(prob, ind):
-            basis_ind = np.zeros(selection.size)
-            basis_ind[ind] = 1
-            selection.value = basis_ind
+        def helper(prob, ind, offset):
+            pt_inds = self.col_inv_[self.col_inv_ == ind]
+            val = np.zeros(self.n_samples_in_pred_x_ * self.n_classes_)
+            val[pt_inds * self.n_classes_ + offset] = 1
+            selection.value = val
             prob.solve(solver=self.solver, verbose=self.verbose, warm_start=True)
-
-            return prob.value
+            return prob.value / self.col_cts_[ind]
 
         for i, prob in enumerate([prob_lb, prob_ub]):
-            self.conf_int_[:, i] = Parallel(n_jobs=self.n_jobs)(
-                    delayed(helper)(prob, ind)
-                    for ind in range(self.n_uniq_cols_ * self.n_classes_))
+            for l in range(self.n_classes_):
+                for ind in range(self.n_uniq_cols_):
+                    self.conf_int_compact_[ind * self.n_classes_ + l, i]= helper(prob, ind, l)
+                # class_inds = np.zeros(self.n_samples_in_pred_x_ * self.n_classes_)
+                # class_inds[np.arange(self.n_samples_in_pred_x_) * self.n_classes_ + l] = 1
+                # self.conf_int_compact[class_inds, i] = Parallel(n_jobs=self.n_jobs)(
+                #         delayed(helper)(prob, ind, l)
+                #         for ind in range(self.n_uniq_cols_))
 
         # do cleanup so we don't have negative lower bounds and upperbounds
         # that are greater than what's possible.
-        pattern_dist = np.expand_dims(self.col_cts_ / np.sum(self.col_cts_), axis=1)
-        #self.conf_int_[:, 0] = np.maximum(self.conf_int_[:, 0], 0)
-        #self.conf_int_[:, 1] = np.minimum(self.conf_int_[:, 1].reshape(self.n_uniq_cols_, self.n_classes_), pattern_dist).reshape(self.n_uniq_cols_ * self.n_classes_)
+        self.conf_int_compact_[:, 0] = np.maximum(self.conf_int_compact_[:, 0], 0)
+        self.conf_int_compact_[:, 1] = np.minimum(self.conf_int_compact_[:, 1], 1)
 
-        if not joint_dist:
-            for i in range(2):
-                self.conf_int_[:, i] = (self.conf_int_[:, i].reshape(self.n_uniq_cols_, self.n_classes_) / pattern_dist).reshape(self.n_uniq_cols_ * self.n_classes_)
+        if expand:
+            self.conf_int_ = np.zeros((self.n_samples_in_pred_x_ * self.n_classes_, 2))
+            expand_col_inv = np.zeros(self.n_samples_in_pred_x_ * self.n_classes_)
+            tmp1 = (self.col_inv_ * self.n_classes_).astype(int)
+            tmp2 = (self.col_inv_ * self.n_classes_ + 1).astype(int)
+            expand_col_inv[0::2] = tmp1
+            expand_col_inv[1::2] = tmp2
+            expand_col_inv = expand_col_inv.astype(int)
 
-        return self.conf_int_
+            self.conf_int_[:, 0] = self.conf_int_compact_[:,0][expand_col_inv]
+            self.conf_int_[:, 1] = self.conf_int_compact_[:,1][expand_col_inv]
+
+            return self.conf_int_
+        else:
+            return self.conf_int_compact_
